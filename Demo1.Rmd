@@ -37,6 +37,7 @@ knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, eval = FALS
 required_packages <- c(
   "tidymodels",      # Modeling framework
   "tidyverse",       # Data manipulation and visualization
+  "themis",          #
   "finetune",        # Model fine-tuning
   "stacks",          # Model stacking
   "caret",           # Classification and regression training
@@ -44,13 +45,15 @@ required_packages <- c(
   "future",          # Parallel processing framework
   "future.apply",    # Parallel versions of base apply functions
   "furrr",           # Apply functions in parallel
+  "progressr",
   "Boruta",          # Feature selection
   "glmnet",          # Lasso and ridge regression
   "xgboost",         # Extreme gradient boosting
   "kernlab",         # Support vector machines (SVM)
   "kknn",            # Weighted k-nearest neighbors
   "ranger",          # Fast random forests
-  "discrim",         # Gaussian naive Bayes
+  "discrim",         # naive Bayes
+  "nnet",            # Neural Net
   "vip",             # Variable importance plots
   "ggvenn",          # Venn diagrams
   "pROC",            # ROC curves and AUC calculation
@@ -705,7 +708,7 @@ toc()
 saveRDS(rfe_result,"fs_rfe.rds")
 ```
 
-### 3.4.2 RFE Features Plotting
+### RFE Features Plotting
 ```{R}
 rfe_result <- readRDS("fs_rfe.rds")
 
@@ -951,6 +954,11 @@ train_fs <- train[c(selected_vars, "target")]
 
 # Create test dataset with the same selected features and target variable
 test_fs <- test[c(selected_vars, "target")]
+
+# 计算类别权重（用于内置不平衡处理）
+class_counts <- table(train_fs$target)
+class_weights <- sum(class_counts) / (length(class_counts) * class_counts)
+cat("类别权重:", class_weights, "\n")
 ```
 
 ## Modeling Preprocessing Recipes
@@ -972,26 +980,38 @@ in their respective workflow setups as follows:
 add_step(step_mutate(target = as.numeric(target) - 1))  # For binary classification (0/1)
 
 ```{r preprocessingRecipes}
-# Load required packages
-library(recipes)
-
-# 1. Dummy recipe for models requiring standardization and dummy encoding
-dummy_recipe <- recipe(target ~ ., data = train_fs) %>%
-  # Convert ordinal factors to numerical scores
-  step_ordinalscore(all_nominal_predictors(), -all_outcomes()) %>%
-  # Create dummy variables for nominal factors
-  step_dummy(all_nominal_predictors(), -all_outcomes()) %>%
-  # Standardize numerical predictors (mean = 0, SD = 1)
-  step_normalize(all_numeric_predictors(), -all_outcomes())
-
-# 2. Tree-based recipe for models not requiring standardization/dummy encoding
-tree_recipe <- recipe(target ~ ., data = train_fs) %>%
-  # Convert ordinal factors to numerical scores
-  step_ordinalscore(all_nominal_predictors(), -all_outcomes())
-  # Nominal factors remain as factors for tree-based models
-  # No standardization for tree-based models
+# 1. 通用基础配方
+base_recipe <- recipe(target ~ ., data = train_fs) %>%
+  step_zv(all_predictors()) %>%                    # 移除零方差变量
+  step_impute_knn(all_numeric_predictors()) %>%    # 数值变量缺失值填充
+  step_impute_mode(all_nominal_predictors()) %>%   # 分类变量用众数填充
+  step_impute_mode(all_ordered_predictors())       # 有序因子用众数填充
 
 
+# 线性模型和SVM：需要完全数值化
+linear_svm_recipe <- base_recipe %>%
+  step_ordinalscore(all_ordered_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.85)
+
+# 树模型：保持变量类型特性
+tree_models_recipe <- base_recipe %>%
+  step_integer(all_ordered_predictors()) %>%
+  step_integer(all_nominal_predictors()) 
+
+# 距离模型（KNN）：需要标准化和适当编码
+distance_recipe <- base_recipe %>%
+  step_ordinalscore(all_ordered_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_nzv(all_predictors())  
+
+# 概率模型（朴素贝叶斯）
+nb_recipe <- base_recipe %>%
+  step_ordinalscore(all_ordered_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
 ```
 
 ## Create cross-validation subsets
@@ -999,12 +1019,321 @@ tree_recipe <- recipe(target ~ ., data = train_fs) %>%
 # Create cross-validation folds
 set.seed(723000)  # Set seed for reproducibility of fold division
 
-folds <- vfold_cv(train_fs, v = 10, strata = target)  # Change dataset, target variable, and number of folds as needed
+folds <- vfold_cv(train_fs, v = 5, strata = target)  # Change dataset, target variable, and number of folds as needed
 
 cat("Created", length(folds$splits), "fold cross-validation subsets\n")
 ```
+# Base Model
+
+## Base Model settings
+```{r }
+# 1. 逻辑回归 L1 (Lasso)
+logistic_l1_spec <- logistic_reg(
+  penalty = tune(), 
+  mixture = 1  # L1正则化
+) %>% 
+  set_engine("glmnet", class_weights = "balanced") %>% 
+  set_mode("classification")
+
+# 2. 高斯朴素贝叶斯
+naive_bayes_spec <- naive_Bayes(
+  smoothness = tune(),
+  Laplace = tune()
+) %>% 
+  set_engine("naivebayes") %>% 
+  set_mode("classification")
+
+# 3. KNN
+knn_spec <- nearest_neighbor(
+  neighbors = tune(),
+  weight_func = tune(),
+  dist_power = tune()
+) %>% 
+  set_engine("kknn") %>% 
+  set_mode("classification")
+
+# 4. 决策树
+decision_tree_spec <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth = tune(),
+  min_n = tune()
+) %>% 
+  set_engine("rpart") %>% 
+  set_mode("classification")
+
+# 5. RBF SVM
+svm_rbf_spec <- svm_rbf(
+  cost = tune(),
+  rbf_sigma = tune(),
+  margin = tune()
+) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("classification")
+
+# 6. 随机森林
+random_forest_spec <- rand_forest(
+  mtry = tune(),
+  trees = 1000,  # 固定树的数量
+  min_n = tune()
+) %>% 
+  set_engine("ranger", 
+             importance = "permutation") %>% 
+  set_mode("classification")
+
+# 7. XGBoost
+xgb_spec <- boost_tree(
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  min_n = tune(),
+  sample_size = tune(),
+  trees = 1000
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+# 8. MLP (神经网络)
+mlp_spec <- mlp(
+  hidden_units = tune(),
+  penalty = tune(),
+  epochs = tune()
+) %>% 
+  set_engine("nnet", MaxNWts = 10000) %>%  # 增加权重限制
+  set_mode("classification")
+
+model_specs <- list(
+  logistic_l1_spec,
+  naive_bayes_spec,
+  knn_spec,
+  decision_tree_spec,
+  svm_rbf_spec,
+  random_forest_spec,
+  xgb_spec,
+  mlp_spec
+)
+```
+
+## workflow set
+```{r }
+# 1. 通用基础配方
+base_recipe <- recipe(target ~ ., data = train_fs) %>%
+  step_zv(all_predictors()) %>%                    # 移除零方差变量
+  step_impute_knn(all_numeric_predictors()) %>%    # 数值变量缺失值填充
+  step_impute_mode(all_nominal_predictors()) %>%   # 分类变量用众数填充
+  step_impute_mode(all_ordered_predictors())       # 有序因子用众数填充
 
 
+# 线性模型和SVM：需要完全数值化
+linear_svm_recipe <- base_recipe %>%
+  step_ordinalscore(all_ordered_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.85)
+
+# 树模型：保持变量类型特性
+tree_models_recipe <- base_recipe %>%
+  step_integer(all_ordered_predictors()) %>%
+  step_integer(all_nominal_predictors()) 
+
+# 距离模型（KNN）：需要标准化和适当编码
+distance_recipe <- base_recipe %>%
+  step_ordinalscore(all_ordered_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_nzv(all_predictors())  
+
+# 概率模型（朴素贝叶斯）
+nb_recipe <- base_recipe %>%
+  step_ordinalscore(all_ordered_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+# 定义评估指标
+imbalance_metrics <- metric_set(roc_auc, pr_auc, recall, precision, f_meas)
+
+# 创建工作流集
+# 创建工作流集合
+
+# 定义预处理配方映射
+preproc_mapping <- list(
+  logistic_l1 = linear_svm_recipe,
+  svm_rbf = linear_svm_recipe,
+  mlp = linear_svm_recipe,
+  knn = distance_recipe,
+  naive_bayes = nb_recipe,
+  decision_tree = tree_models_recipe,
+  random_forest = tree_models_recipe,
+  xgb = tree_models_recipe
+)
+
+model_set <- workflow_set(
+  preproc = preproc_mapping,
+  models = model_specs,
+  cross = FALSE
+) 
+
+print(model_set)
+```
+
+### 5.2定义超参数网格
+```{r parmsModels}
+cat("=== 定义超参数网格 ===\n")
+
+# 1. 逻辑回归超参数网格
+lr_grid <- grid_latin_hypercube(
+  penalty(range = c(-6, 1)),  # 10^-6 到 10
+  mixture(range = c(0, 1)),
+  size = 100
+)
+
+# 2. K最近邻超参数网络
+knn_grid <- grid_regular(
+  neighbors(range = c(3, 30)),      # 邻居数量
+  weight_func(values = c("rectangular", "triangular", "epanechnikov", "gaussian")),
+  dist_power(range = c(1, 2)),      # 距离幂次 (1=曼哈顿, 2=欧几里得)
+  levels = c(10, 4, 2)
+  
+)
+
+# 3. 高斯贝叶斯超参数网格
+nb_grid <- grid_regular(
+  smoothness(range = c(0, 2)),
+  Laplace(range = c(0, 2)),
+  levels = 10  # 生成10 *10 水平组合
+)
+
+# 4. 线性SVM超参数网络
+svm_linear_grid <- grid_regular(
+  # 正则化参数
+  cost(range = c(-3, 3)),  # 10^-3 到 1000
+  levels = 100
+)
+
+# 5. 径向基核SVM超参数网络
+svm_rbf_grid <- grid_latin_hypercube(
+  cost(range = c(-3, 3)),      # 10^-3 到 1000
+  rbf_sigma(range = c(-5, 1)), # 10^-5 到 10
+  size = 100
+)
+
+# 6. 随机森林超参数网格
+rf_grid <- grid_latin_hypercube(
+  mtry(range = c(2, (ncol(train_fs) - 1))),
+  trees(range = c(100, 500)),
+  # sample_size = sample_prop(c(0.5, 1.0)),
+  min_n(range = c(5, 15)),
+  # levels = 5
+  size = 100
+)
+
+# 7.XGBoost超参数网格
+xgb_grid <- grid_latin_hypercube(
+  trees(range = c(100, 500)),
+  tree_depth(range = c(3, 8)),
+  learn_rate(range = c(-3, -0.3)),
+  loss_reduction(range = c(-3, 0)),
+  min_n(range = c(5, 15)),
+  size = 100
+)
+
+# 8. MLP超参数网格
+mlp_grid <- grid_latin_hypercube(
+  hidden_units(range = c(1, 20)),    # 隐藏单元数量
+  penalty(range = c(-5, 0)),         # 权重衰减 (L2正则化)
+  epochs(range = c(50, 300)),        # 训练轮数
+  size = 100
+)
+
+param_grids <- list(
+  lr = lr_grid,
+  knn = knn_grid,
+  naive_bayes = nb_grid,
+  svm_linear = svm_linear_grid,
+  svm_rbf = svm_rbf_grid,
+  rf = rf_grid,
+  xgb = xgb_grid,
+  mlp = mlp_grid
+)
+```
+
+## 并行调优
+```{R}
+cat("\n=== 超参数调优 ===\n")
+
+race_ctrl <-
+   control_race(
+      allow_par = TRUE,
+      parallel_over = "everything",
+      save_pred = TRUE,
+      save_workflow = TRUE,
+      burn_in = 5           # 至少评估5折后才开始淘汰
+   )
+
+# 并行调优所有模型
+set.seed(723000)
+
+# 确保网格名称与工作流ID匹配
+tic("超参数调优")
+tuning_results <- model_set %>%
+  # option_add_parameters(param_grids) %>%
+  workflow_map(
+    "tune_race_anova",
+    seed = 723000,
+    resamples = folds,
+    grid = 15,
+    metrics = imbalance_metrics,
+    verbose = TRUE,
+    control = race_ctrl
+)
+toc()
+
+
+cat("\n=== 所有模型超参数调优完成！ ===\n")
+
+saveRDS(tuning_results,"tuning_results.rds")
+
+```
+
+## Analysis
+```{r }
+# 提取每个模型的最佳参数
+best_params_list <- map(set_names(model_ids), ~{
+  tuning_results %>%
+    extract_workflow_set_result(.x) %>%
+    select_best(metric = "roc_auc")
+})
+
+# 创建最终工作流列表
+final_workflows <- map2(model_ids, best_params_list, ~{
+  tuning_results %>%
+    extract_workflow(.x) %>%
+    finalize_workflow(.y)
+})
+
+# 查看第一个模型的最终工作流
+final_workflows[[1]]
+
+# 使用最佳参数在所有CV折上拟合模型
+cv_fits <- map(final_workflows, ~{
+  fit_resamples(
+    .x,
+    resamples = folds,
+    metrics = imbalance_metrics,
+    control = control_resamples(
+      save_pred = TRUE,      # 保存预测结果
+      save_workflow = TRUE  # 保存工作流
+    )
+  )
+})
+
+# 查看第一个模型的CV拟合结果
+cv_fits[[1]]
+```
+
+```{R}
+# 关闭并行后端
+plan(sequential)
+```
 
 # Conclusion
 
